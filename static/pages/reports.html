@@ -102,6 +102,7 @@ async function loadBuilds() {
     <div class="build-item ${b.id===currentBuild?'active':''}" onclick="selectBuild('${b.id}')">
       <div class="row spread"><strong>${esc(b.name||b.id)}</strong>${statusBadge(b.status)}</div>
       <div class="muted" style="font-size:12px">通过 ${b.passed||0}/${b.total||0} · ${fmtDur(b.duration)} · ${fmtTime(b.finished_at)}</div>
+      ${(b.flaky||0) ? `<div style="font-size:12px;color:var(--amber)">↻ ${b.flaky} 个用例重试后转绿</div>` : ""}
     </div>`).join("");
 }
 
@@ -119,12 +120,13 @@ function renderReport(r) {
   const groups = Object.entries(r.by_group || {});
   const prio = Object.entries(r.by_priority || {});
   const failures = r.failures || [];
+  const flakyCases = r.flaky_cases || [];
   const slowest = r.slowest || [];
 
   $("#report-body").innerHTML = `
     <div class="grid cols-4 mt">
       <div class="stat primary"><div class="v">${s.total||0}</div><div class="k">总用例</div></div>
-      <div class="stat good"><div class="v">${s.pass_rate ?? 0}%</div><div class="k">通过率</div></div>
+      <div class="stat good"><div class="v">${s.pass_rate ?? 0}%</div><div class="k">通过率（最终结论）</div></div>
       <div class="stat ${(s.failed||0)?'bad':'good'}"><div class="v">${(s.failed||0)+(s.error||0)+(s.timeout||0)}</div><div class="k">失败/错误/超时</div></div>
       <div class="stat primary"><div class="v">${fmtDur(r.duration)}</div><div class="k">总耗时</div></div>
     </div>
@@ -132,12 +134,25 @@ function renderReport(r) {
       ${statusBadge(r.status)}
       <span class="muted" style="font-size:13px">触发 ${esc(r.trigger||'manual')} · ${fmtTime(r.started_at)} → ${fmtTime(r.finished_at)}</span>
     </div>
+    <div class="mt row" style="gap:16px;font-size:13px">
+      <span class="muted">首轮通过率 <strong style="color:${(s.first_pass_rate??100)<(s.pass_rate??0)?'var(--amber)':'var(--green)'}">${s.first_pass_rate ?? s.pass_rate ?? 0}%</strong></span>
+      <span class="muted">经历重试 <strong>${s.retried||0}</strong> 个用例</span>
+      <span class="muted">重试后转绿 <strong style="color:var(--amber)">${s.flaky||0}</strong> 个</span>
+    </div>
     <div class="mt grid cols-4">
       <div class="stat"><div class="v">${fmtDur(d.avg)}</div><div class="k">平均耗时</div></div>
       <div class="stat"><div class="v">${fmtDur(d.median)}</div><div class="k">中位耗时</div></div>
       <div class="stat"><div class="v">${fmtDur(d.p95)}</div><div class="k">P95</div></div>
       <div class="stat"><div class="v">${fmtDur(d.max)}</div><div class="k">最慢</div></div>
     </div>
+
+    ${flakyCases.length ? `<div class="mt"><h3>重试后通过（偶发抖动，已自愈）</h3><table>
+      <thead><tr><th>用例</th><th>首轮状态</th><th>尝试次数</th><th>逐轮结果</th><th>总耗时</th></tr></thead>
+      <tbody>${flakyCases.map(f => `<tr><td>${esc(f.case_name||f.case_id)}</td>
+        <td>${statusBadge(f.first_status)}</td>
+        <td><span class="tag">${f.attempt_count} 次</span></td>
+        <td class="muted" style="font-size:12px">${(f.attempts||[]).map(a => `#${a.attempt} ${a.status}`).join(" → ")}</td>
+        <td>${fmtDur(f.duration)}</td></tr>`).join("")}</tbody></table></div>` : ""}
 
     ${groups.length ? `<div class="mt"><h3>按分组</h3><table>
       <thead><tr><th>分组</th><th>总数</th><th>通过</th><th>失败</th><th>通过率</th><th>耗时</th></tr></thead>

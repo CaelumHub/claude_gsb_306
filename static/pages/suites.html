@@ -53,6 +53,18 @@
         <div><label>执行环境</label><select id="s-env"><option value="">— 默认 —</option></select></div>
         <div><label>选择用例</label></div>
       </div>
+      <div class="mt">
+        <label style="display:inline-flex;gap:6px;font-weight:400;color:var(--text);align-items:center">
+          <input type="checkbox" id="s-retry-enabled" style="width:auto"
+            onchange="$('#s-retry-config').style.display = this.checked ? 'flex' : 'none'">
+          默认重试策略（用例可单独覆盖：用例级字段优先于此处配置）
+        </label>
+        <div class="row mt" id="s-retry-config" style="display:none;gap:10px">
+          <div><label>最大尝试次数（≤5）</label><input type="number" id="s-retry-attempts" value="2" min="1" max="5" style="max-width:120px"></div>
+          <div><label>重试间隔（毫秒）</label><input type="number" id="s-retry-backoff" value="200" min="0" style="max-width:140px"></div>
+          <div><label>额外耗时预算（秒，0=不限）</label><input type="number" id="s-retry-budget" value="60" min="0" style="max-width:150px"></div>
+        </div>
+      </div>
       <div class="case-pick mt" id="case-pick"><div class="muted">加载用例…</div></div>
       <div class="row mt">
         <button class="btn" id="btn-save">保存</button>
@@ -95,6 +107,7 @@ async function loadSuites() {
         <div class="row">
           <strong>${esc(s.name)}</strong>
           ${s.group ? `<span class="tag">${esc(s.group)}</span>` : ""}
+          ${s.retry ? `<span class="tag" title="套件默认重试策略">重试×${(s.retry.max_attempts ?? 1)}</span>` : ""}
           <span class="muted" style="font-size:13px">${s.case_count} 个用例</span>
         </div>
         <div class="row">
@@ -152,8 +165,28 @@ function newSuite() {
   $("#edit-title").textContent = "新建套件";
   $("#s-name").value = ""; $("#s-desc").value = ""; $("#s-group").value = "";
   $("#s-env").value = "";
+  fillSuiteRetry(null);
   renderCasePick([]);
   $("#edit-card").style.display = "block";
+}
+
+function fillSuiteRetry(r) {
+  const on = !!r;
+  $("#s-retry-enabled").checked = on;
+  $("#s-retry-config").style.display = on ? "flex" : "none";
+  r = r || {};
+  $("#s-retry-attempts").value = r.max_attempts ?? 2;
+  $("#s-retry-backoff").value = r.backoff_ms ?? 200;
+  $("#s-retry-budget").value = r.max_extra_duration ?? 60;
+}
+
+function readSuiteRetry() {
+  if (!$("#s-retry-enabled").checked) return null;  // 不配置 → 用例自行决定，默认不重试
+  return {
+    max_attempts: Math.max(1, Math.min(5, parseInt($("#s-retry-attempts").value || "1", 10))),
+    backoff_ms: Math.max(0, parseInt($("#s-retry-backoff").value || "0", 10)),
+    max_extra_duration: Math.max(0, parseFloat($("#s-retry-budget").value || "0")),
+  };
 }
 
 function editSuite(id) {
@@ -163,6 +196,7 @@ function editSuite(id) {
   $("#edit-title").textContent = "编辑套件";
   $("#s-name").value = s.name || ""; $("#s-desc").value = s.description || "";
   $("#s-group").value = s.group || ""; $("#s-env").value = s.env_id || "";
+  fillSuiteRetry(s.retry);
   renderCasePick(s.case_ids || []);
   $("#edit-card").style.display = "block";
 }
@@ -182,7 +216,7 @@ $("#btn-save").onclick = async () => {
   if (!name) return toast("请输入套件名称", "error");
   const caseIds = $$(".pick").filter(c => c.checked).map(c => c.value);
   const body = { name, description: $("#s-desc").value, group: $("#s-group").value,
-    env_id: $("#s-env").value || null, case_ids: caseIds };
+    env_id: $("#s-env").value || null, case_ids: caseIds, retry: readSuiteRetry() };
   if (editingId) {
     await api(`/api/suites/${editingId}`, { method: "PUT", body });
     toast("已保存");

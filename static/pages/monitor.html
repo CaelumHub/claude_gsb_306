@@ -152,7 +152,8 @@ function renderResults(results, running) {
   if (!results.length) { host.innerHTML = '<div class="muted">' + (running ? "执行中，暂无结果…" : "无结果") + '</div>'; return; }
   host.innerHTML = `<div style="max-height:260px;overflow:auto">` + results.map(r => `
     <div class="result-item row spread">
-      <span>${esc(r.case_name||r.case_id)} ${statusBadge(r.status)}</span>
+      <span>${esc(r.case_name||r.case_id)} ${statusBadge(r.status)}
+        ${(r.attempt_count||1) > 1 ? `<span class="tag" title="共尝试 ${r.attempt_count} 次，首轮 ${esc(r.first_status||'')}">尝试×${r.attempt_count}${r.flaky?' · 转绿':''}</span>` : ""}</span>
       <span class="mono muted" style="font-size:12px">${fmtDur(r.duration)}</span>
     </div>`).join("") + "</div>";
 }

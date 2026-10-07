@@ -26,6 +26,7 @@ import time
 from typing import Any, Optional
 
 from .models import new_id
+from .retry import RETRYABLE_STATUSES, should_retry
 
 
 class ExecutionError(Exception):
@@ -132,12 +133,17 @@ class MockTarget:
     不同环境可以配不同的 ``latency_ms``、``fail_rate``、``base_url``，
     同一个用例在不同环境下会跑出不同的耗时甚至成败——这正是环境隔离
     要表达的东西：用例逻辑不变，但运行环境变了，结果随之变化。
+
+    ``attempt`` 是当前的尝试轮次（0 为首轮）：失败注入的抽签把轮次计入
+    种子，于是同一用例在不同轮次可能抽出不同结果——这正模拟了真实世界
+    的「偶发失败」：首轮撞上抖动失败，重试时抖动已过去，转而通过。
     """
 
-    def __init__(self, env_config: dict):
+    def __init__(self, env_config: dict, attempt: int = 0):
         self.base_url = (env_config or {}).get("base_url", "http://mock.local")
         self.latency_ms = int((env_config or {}).get("latency_ms", 20))
         self.fail_rate = float((env_config or {}).get("fail_rate", 0.0))
+        self.attempt = attempt
 
     def request(self, case_id: str, step_index: int, method: str,
                 url: str, params: dict = None, headers: dict = None,
@@ -154,8 +160,9 @@ class MockTarget:
             payload = {"ok": False, "error": "simulated server error"}
         if "slow" in path.lower():
             latency += 600
-        # 环境级失败率：确定性伪随机，同一环境同一用例结果稳定
-        if self.fail_rate > 0 and _seeded_int(case_id, step_index, "fail") % 1000 < self.fail_rate * 1000:
+        # 环境级失败率：确定性伪随机，同一环境同一用例同一轮次结果稳定；
+        # 轮次（attempt）不同则重新抽签，模拟「偶发抖动，重试可恢复」
+        if self.fail_rate > 0 and _seeded_int(case_id, step_index, "fail", self.attempt) % 1000 < self.fail_rate * 1000:
             status = 500
             payload = {"ok": False, "error": "injected failure (env fail_rate)"}
         if "notfound" in path.lower() or status == 404:
@@ -357,8 +364,13 @@ class TestExecutor:
 
     # -- 用例执行 ---------------------------------------------------------
     def execute_case(self, case: dict, env_config: dict = None,
-                     cancel_event=None, timeout: float = None) -> dict:
-        """执行一个用例，返回结构化的执行结果。"""
+                     cancel_event=None, timeout: float = None,
+                     attempt: int = 0) -> dict:
+        """执行一个用例（单轮），返回结构化的执行结果。
+
+        ``attempt`` 为当前轮次（0 表示首轮），会传入模拟目标影响失败注入
+        的抽签；自动重试由 :meth:`execute_with_retry` 编排。
+        """
         env_config = env_config or {}
         case_id = case.get("id", new_id("case"))
         case_name = case.get("name", "未命名用例")
@@ -366,7 +378,7 @@ class TestExecutor:
         started = time.time()
         deadline = started + timeout
 
-        self.target = MockTarget(env_config)
+        self.target = MockTarget(env_config, attempt=attempt)
         variables = dict(env_config.get("variables", {}))
         variables["case"] = {"id": case_id, "name": case_name}
 
@@ -411,6 +423,89 @@ class TestExecutor:
 
         assertions = variables.get("_assertions", [])
         return self._finalize(case, status, steps_out, assertions, logs, started)
+
+    # -- 自动重试编排 ------------------------------------------------------
+    def execute_with_retry(self, case: dict, env_config: dict = None,
+                           policy: dict = None, env_id: str = None,
+                           cancel_event=None, timeout: float = None) -> dict:
+        """按重试策略执行用例：失败后按条件再试，直到通过或策略用尽。
+
+        返回的结果是**最终一轮**的完整结果，并附加：
+
+        - ``attempts``       每一轮的摘要（轮次 / 状态 / 耗时 / 失败断言），
+                             全量保留供报告与排查回溯；
+        - ``attempt_count``  总尝试次数（>1 即发生过重试）；
+        - ``first_status``   首轮状态（报告用它算「首轮通过率」）；
+        - ``retried``        是否经历了重试；
+        - ``flaky``          首轮失败但重试后转绿（偶发抖动被自愈）；
+        - ``duration``       覆盖为含全部轮次与退避的总耗时，让报告里的
+                             耗时统计真实反映重试成本；
+        - ``logs``           各轮日志合并，按轮次分隔，重试决策也写入日志。
+
+        时间膨胀控制：次数受策略与平台硬上限约束；第 2 轮起的累计耗时 +
+        退避超过 ``max_extra_duration`` 预算即停止；退避分片睡眠，取消事件
+        可即时打断。
+        """
+        started = time.time()
+        max_attempts = policy["max_attempts"] if policy else 1
+        rounds: list[dict] = []      # 每轮完整结果
+        attempts: list[dict] = []    # 每轮摘要（落盘用）
+        extra = 0.0                  # 重试带来的额外耗时（第 2 轮起 + 退避）
+
+        for attempt_no in range(1, max_attempts + 1):
+            if attempt_no > 1 and cancel_event is not None and cancel_event.is_set():
+                break
+            result = self.execute_case(case, env_config, cancel_event=cancel_event,
+                                       timeout=timeout, attempt=attempt_no - 1)
+            rounds.append(result)
+            attempts.append({
+                "attempt": attempt_no,
+                "status": result["status"],
+                "duration": result["duration"],
+                "message": result.get("message", ""),
+                "failed_assertions": [
+                    {"name": a.get("name"), "type": a.get("type"),
+                     "message": a.get("message")}
+                    for a in result.get("assertions", []) if not a.get("ok")
+                ],
+            })
+            if attempt_no > 1:
+                extra += result["duration"]
+            if not should_retry(policy, result, env_id, attempt_no, extra):
+                break
+            backoff = (policy.get("backoff_ms") or 0) / 1000.0
+            if backoff > 0:
+                try:
+                    self._interruptible_sleep(backoff, cancel_event)
+                except ExecutionError:
+                    break  # 退避期间被取消：不再重试，以当前结果收尾
+                extra += backoff
+
+        final = rounds[-1]
+        n = len(rounds)
+        first_status = attempts[0]["status"]
+        final["attempts"] = attempts
+        final["attempt_count"] = n
+        final["first_status"] = first_status
+        final["retried"] = n > 1
+        final["flaky"] = first_status in RETRYABLE_STATUSES and final["status"] == "passed"
+        final["duration"] = round(time.time() - started, 3)
+        if policy:
+            final["retry_policy"] = policy
+
+        if n > 1:
+            logs: list[str] = []
+            for i, r in enumerate(rounds):
+                logs.append(f"—— 第 {i + 1}/{n} 次尝试 ——")
+                logs.extend(r.get("logs", []))
+                if i < n - 1:
+                    logs.append(f"第 {i + 1} 次尝试结果: {r['status']}，按策略准备重试")
+            final["logs"] = logs
+            if final["flaky"]:
+                final["message"] = f"首轮 {first_status}，重试后通过（共 {n} 次尝试）"
+            else:
+                final["message"] = f"经 {n} 次尝试最终 {final['status']}"
+        return final
 
     def _finalize(self, case: dict, status: str, steps: list, assertions: list,
                   logs: list, started: float, message: str = "") -> dict:

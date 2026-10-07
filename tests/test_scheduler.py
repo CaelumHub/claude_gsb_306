@@ -41,6 +41,13 @@ class TestSchedulerEndToEnd(unittest.TestCase):
         self.registry, self.builds, self.env_mgr, self.sched = _make_scheduler(self.tmp.name)
 
     def tearDown(self):
+        # 等后台构建线程收尾完毕再清理临时目录，避免与落盘线程竞争
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with self.sched._running_lock:
+                if not self.sched._running:
+                    break
+            time.sleep(0.05)
         self.sched.shutdown()
         self.tmp.cleanup()
 

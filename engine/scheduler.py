@@ -26,6 +26,7 @@ from typing import Optional
 
 from .cron import cron_matches, parse_cron
 from .models import new_id
+from .retry import resolve_policy
 
 
 class Scheduler:
@@ -112,7 +113,8 @@ class Scheduler:
             }
 
         self._build_pool.submit(
-            self._run_build, project_id, build_id, cases, env_id, cancel_event)
+            self._run_build, project_id, build_id, cases, env_id, cancel_event,
+            suite.get("retry"))
 
         # 若是定时触发，记录一次计划运行历史
         if schedule_id:
@@ -146,7 +148,8 @@ class Scheduler:
 
     # ------------------------------------------------------------------ 构建执行
     def _run_build(self, project_id: str, build_id: str, cases: list,
-                   env_id: str, cancel_event: threading.Event) -> None:
+                   env_id: str, cancel_event: threading.Event,
+                   suite_retry: Optional[dict] = None) -> None:
         store = self.builds.for_project(project_id)
         env_config = self.env_manager.to_executor_config(env_id)
         store.set_total(build_id, len(cases))
@@ -163,7 +166,7 @@ class Scheduler:
                         break
                     futures[pool.submit(
                         self._run_one, case, env_config, env_id, i,
-                        cancel_event)] = case
+                        cancel_event, suite_retry)] = case
 
                 for future in as_completed(futures):
                     case = futures[future]
@@ -200,7 +203,7 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001
             store.append_log(build_id, f"构建执行异常: {exc}")
 
-        # 终态判定
+        # 终态判定（按最终结论：重试后转绿的用例不会让构建变红）
         build = store.get(build_id)
         if cancel_event.is_set():
             status = "cancelled"
@@ -211,6 +214,11 @@ class Scheduler:
         store.finish(build_id, status)
         store.append_log(build_id, f"构建结束: {status}（通过 {build.get('passed', 0)}"
                                    f"/{build.get('total', 0)}）")
+        if build.get("retried"):
+            store.append_log(
+                build_id,
+                f"重试统计: {build.get('retried', 0)} 个用例经历重试，"
+                f"其中 {build.get('flaky', 0)} 个重试后转绿")
 
         # 收尾：报告 + 覆盖率 + 通知 + 自动缺陷
         self._finalize(project_id, build_id)
@@ -219,10 +227,14 @@ class Scheduler:
             self._running.pop(build_id, None)
 
     def _run_one(self, case: dict, env_config: dict, env_id: str,
-                 index: int, cancel_event: threading.Event) -> dict:
-        result = self.executor.execute_case(
-            case, env_config, cancel_event=cancel_event,
-            timeout=case.get("timeout", 60))
+                 index: int, cancel_event: threading.Event,
+                 suite_retry: Optional[dict] = None) -> dict:
+        # 重试策略优先级：用例字段 > 套件字段 > 平台默认（不重试），
+        # 字段级覆盖，与配置先后顺序无关。
+        policy = resolve_policy(case.get("retry"), suite_retry)
+        result = self.executor.execute_with_retry(
+            case, env_config, policy=policy, env_id=env_id,
+            cancel_event=cancel_event, timeout=case.get("timeout", 60))
         result["env_id"] = env_id
         result["order"] = index
         return result
@@ -266,12 +278,20 @@ class Scheduler:
         self.notify.fire(project_id, "build.finished", payload)
         self.notify.fire(project_id, event, payload)
 
-        # 自动缺陷（项目配置开启时，把失败用例转成缺陷）
+        # 自动缺陷（项目配置开启时，把最终失败的用例转成缺陷；
+        # 最终通过的用例则把此前挂着未闭环的自动缺陷标记 fixed，
+        # 保证「报告结论」与「缺陷列表」两边一致，不自相矛盾）
         project = self.registry.store("projects").get(project_id)
         if project and project.get("auto_create_defects"):
             failures = store.results(build_id, where=[("status", "in", ["failed", "error", "timeout"])])
             for fr in failures[:20]:
                 self.defects.create_from_case(project_id, fr, build_id)
+            passed_ids = [r.get("case_id") for r in
+                          store.results(build_id, where=[("status", "eq", "passed")])]
+            resolved = self.defects.auto_resolve_passed(project_id, passed_ids, build_id)
+            if resolved:
+                store.append_log(build_id,
+                                 f"自动闭环 {len(resolved)} 个缺陷（对应用例本次构建已通过）")
 
     # ------------------------------------------------------------------ 定时循环
     def _tick_loop(self) -> None:

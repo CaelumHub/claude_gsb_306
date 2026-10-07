@@ -78,6 +78,35 @@
         </div>
 
         <div class="mt">
+          <label style="display:inline-flex;gap:6px;font-weight:400;color:var(--text);align-items:center">
+            <input type="checkbox" id="c-retry-enabled" style="width:auto"
+              onchange="$('#retry-config').style.display = this.checked ? 'block' : 'none'">
+            自定义重试策略（不勾选则继承套件默认；勾选后次数填 1 可屏蔽套件重试）
+          </label>
+          <div id="retry-config" style="display:none;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-top:8px">
+            <div class="grid cols-3">
+              <div><label>最大尝试次数（含首轮，≤5）</label><input type="number" id="c-retry-attempts" value="3" min="1" max="5"></div>
+              <div><label>重试间隔（毫秒）</label><input type="number" id="c-retry-backoff" value="200" min="0"></div>
+              <div><label>重试额外耗时预算（秒，0=不限）</label><input type="number" id="c-retry-budget" value="60" min="0"></div>
+            </div>
+            <div class="mt">
+              <label>触发重试的终态</label>
+              <div class="row" style="gap:14px">
+                <label style="font-weight:400;display:inline-flex;gap:4px;align-items:center"><input type="checkbox" class="c-retry-on" value="failed" checked style="width:auto">失败</label>
+                <label style="font-weight:400;display:inline-flex;gap:4px;align-items:center"><input type="checkbox" class="c-retry-on" value="error" checked style="width:auto">错误</label>
+                <label style="font-weight:400;display:inline-flex;gap:4px;align-items:center"><input type="checkbox" class="c-retry-on" value="timeout" checked style="width:auto">超时</label>
+              </div>
+            </div>
+            <div class="grid cols-2 mt">
+              <div><label>仅这些断言类型失败时重试（逗号分隔，空=不限）</label>
+                <input type="text" id="c-retry-asserts" placeholder="status, equals"></div>
+              <div><label>仅在这些环境重试（空=不限）</label>
+                <select id="c-retry-envs" multiple size="3"></select></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt">
           <label>步骤与断言</label>
           <div class="step-btns">
             <button class="btn secondary" onclick="addStep('request')">+ 请求</button>
@@ -112,10 +141,10 @@ let steps = [];
 async function init() {
   const params = new URLSearchParams(location.search);
   projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
-  await loadCases();
+  await Promise.all([loadCases(), loadEnvOptions()]);
 }
 
-async function switchProject(id) { projectId = id; currentId = null; steps = []; resetEditor(); await loadCases(); }
+async function switchProject(id) { projectId = id; currentId = null; steps = []; resetEditor(); await Promise.all([loadCases(), loadEnvOptions()]); }
 
 async function loadTags() {
   if (!projectId) return;
@@ -141,6 +170,7 @@ async function loadCases() {
     <div class="case-item ${c.id === currentId ? 'active' : ''}" onclick="loadCase('${c.id}')">
       <div class="cname">${esc(c.name)}</div>
       <div class="cmeta">${priorityBadge(c.priority)} ${tagsHtml(c.tags)}
+        ${c.retry ? `<span class="tag" title="自定义重试策略">重试×${(c.retry.max_attempts ?? 1)}</span>` : ""}
         <span style="margin-left:6px">${(c.steps||[]).length} 步</span></div>
     </div>`).join("");
   await loadTags();
@@ -151,9 +181,47 @@ function resetEditor() {
   $("#c-name").value = ""; $("#c-desc").value = "";
   $("#c-priority").value = "P2"; $("#c-timeout").value = "60";
   $("#c-tags").value = ""; $("#c-enabled").checked = true;
+  fillRetryForm(null);
   $("#editor-title").textContent = "新建用例";
   $("#btn-delete").style.display = "none";
   renderSteps();
+}
+
+// ---------- 重试策略表单 ----------
+async function loadEnvOptions() {
+  if (!projectId) return;
+  const d = await api(`/api/projects/${projectId}/environments`);
+  const sel = $("#c-retry-envs");
+  const keep = new Set(Array.from(sel.selectedOptions || []).map(o => o.value));
+  sel.innerHTML = (d.environments || []).map(e =>
+    `<option value="${e.id}" ${keep.has(e.id) ? "selected" : ""}>${esc(e.name)}</option>`).join("");
+}
+
+function fillRetryForm(r) {
+  const on = !!r;
+  $("#c-retry-enabled").checked = on;
+  $("#retry-config").style.display = on ? "block" : "none";
+  r = r || {};
+  $("#c-retry-attempts").value = r.max_attempts ?? 3;
+  $("#c-retry-backoff").value = r.backoff_ms ?? 200;
+  $("#c-retry-budget").value = r.max_extra_duration ?? 60;
+  const onSet = new Set(r.retry_on || ["failed", "error", "timeout"]);
+  $$(".c-retry-on").forEach(cb => { cb.checked = onSet.has(cb.value); });
+  $("#c-retry-asserts").value = (r.only_assertion_types || []).join(", ");
+  const envSet = new Set(r.only_envs || []);
+  Array.from($("#c-retry-envs").options).forEach(o => { o.selected = envSet.has(o.value); });
+}
+
+function readRetry() {
+  if (!$("#c-retry-enabled").checked) return null;  // 不配置 → 继承套件策略
+  return {
+    max_attempts: Math.max(1, Math.min(5, parseInt($("#c-retry-attempts").value || "1", 10))),
+    backoff_ms: Math.max(0, parseInt($("#c-retry-backoff").value || "0", 10)),
+    max_extra_duration: Math.max(0, parseFloat($("#c-retry-budget").value || "0")),
+    retry_on: $$(".c-retry-on").filter(c => c.checked).map(c => c.value),
+    only_assertion_types: ($("#c-retry-asserts").value || "").split(",").map(s => s.trim()).filter(Boolean),
+    only_envs: Array.from($("#c-retry-envs").selectedOptions).map(o => o.value),
+  };
 }
 
 async function loadCase(id) {
@@ -163,6 +231,7 @@ async function loadCase(id) {
   $("#c-name").value = c.name || ""; $("#c-desc").value = c.description || "";
   $("#c-priority").value = c.priority || "P2"; $("#c-timeout").value = c.timeout || 60;
   $("#c-tags").value = (c.tags || []).join(", "); $("#c-enabled").checked = c.enabled !== false;
+  fillRetryForm(c.retry);
   $("#editor-title").textContent = "编辑用例";
   $("#btn-delete").style.display = "inline-flex";
   steps = (c.steps || []).map(s => ({ ...s }));
@@ -284,6 +353,7 @@ function readEditor() {
     timeout: parseInt($("#c-timeout").value || "60", 10),
     tags: ($("#c-tags").value || "").split(",").map(t => t.trim()).filter(Boolean),
     enabled: $("#c-enabled").checked,
+    retry: readRetry(),
     steps: serializeSteps(),
   };
 }

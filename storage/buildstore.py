@@ -66,6 +66,9 @@ def _empty_build(build_id: str, project_id: str, **kw: Any) -> dict:
         "error": 0,
         "skipped": 0,
         "timeout": 0,
+        "retried": 0,        # 经历了重试（尝试次数 > 1）的用例数
+        "flaky": 0,          # 首轮失败、重试后转绿的用例数
+        "first_passed": 0,   # 首轮即通过的用例数（算首轮通过率用）
         "started_at": None,
         "finished_at": None,
         "duration": 0.0,
@@ -191,10 +194,18 @@ class BuildStore:
         with FileLock(self._lock(build_id)):
             build = read_json(self._build_path(build_id), _empty_build(build_id, self.project_id))
 
-            # 1) 更新聚合计数
+            # 1) 更新聚合计数（按最终状态计：重试后转绿的用例只计为通过，
+            #    构建红绿与通过率都由最终结论决定）
             status = result.get("status", "error")
             if status in ("passed", "failed", "error", "skipped", "timeout"):
                 build[status] = build.get(status, 0) + 1
+            if result.get("retried"):
+                build["retried"] = build.get("retried", 0) + 1
+            if result.get("flaky"):
+                build["flaky"] = build.get("flaky", 0) + 1
+            first_status = result.get("first_status") or status
+            if first_status == "passed":
+                build["first_passed"] = build.get("first_passed", 0) + 1
             build["durations"] = build.get("durations", []) + [result.get("duration", 0.0)]
 
             group = result.get("group") or "默认"

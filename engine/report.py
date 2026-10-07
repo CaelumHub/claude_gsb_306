@@ -65,7 +65,13 @@ class ReportGenerator:
         skipped = build.get("skipped", 0)
         timeout = build.get("timeout", 0)
         finished = total - skipped
+        # 通过率按「最终结论」算（重试后转绿计为通过）——它决定构建红绿；
+        # 首轮通过率单独给出，作为套件稳定性的真实参照（暴露抖动程度）。
         pass_rate = round(passed / finished * 100, 1) if finished else 0.0
+        first_passed = build.get("first_passed")
+        if first_passed is None:
+            first_passed = passed  # 兼容重试功能上线前的旧构建
+        first_pass_rate = round(first_passed / finished * 100, 1) if finished else 0.0
 
         durations = build.get("durations", [])
         report = {
@@ -87,6 +93,9 @@ class ReportGenerator:
                 "skipped": skipped,
                 "timeout": timeout,
                 "pass_rate": pass_rate,
+                "first_pass_rate": first_pass_rate,
+                "retried": build.get("retried", 0),
+                "flaky": build.get("flaky", 0),
             },
             "durations": {
                 "avg": round(statistics.mean(durations), 3) if durations else 0.0,
@@ -100,6 +109,7 @@ class ReportGenerator:
             "by_priority": build.get("by_priority", {}),
             "slowest": self._slowest(store, build_id, 10),
             "failures": self._failures(store, build_id, 50),
+            "flaky_cases": self._flaky_cases(store, build_id, 50),
             "generated_at": time.time(),
         }
         return report
@@ -132,6 +142,20 @@ class ReportGenerator:
             })
         return out
 
+    def _flaky_cases(self, store, build_id: str, top: int) -> list[dict]:
+        """首轮失败、重试后转绿的用例清单（清楚标注尝试次数与每轮状态）。"""
+        records = store.results(build_id, where=[("flaky", "eq", True)], limit=top)
+        return [{
+            "case_id": r.get("case_id"),
+            "case_name": r.get("case_name"),
+            "group": r.get("group"),
+            "priority": r.get("priority"),
+            "first_status": r.get("first_status"),
+            "attempt_count": r.get("attempt_count", 1),
+            "attempts": r.get("attempts", []),
+            "duration": r.get("duration"),
+        } for r in records]
+
     # -- 项目级趋势 / 汇总 ------------------------------------------------
     def project_report(self, project_id: str, limit: int = 20) -> dict:
         store = self.builds.for_project(project_id)
@@ -147,6 +171,7 @@ class ReportGenerator:
                 "total": b.get("total", 0),
                 "passed": b.get("passed", 0),
                 "failed": b.get("failed", 0) + b.get("error", 0) + b.get("timeout", 0),
+                "flaky": b.get("flaky", 0),
                 "pass_rate": round(b.get("passed", 0) / finished * 100, 1) if finished else 0,
                 "duration": b.get("duration", 0.0),
                 "finished_at": b.get("finished_at"),

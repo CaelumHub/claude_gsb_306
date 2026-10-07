@@ -111,9 +111,18 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "group": "smoke",
         "env_id": env["id"],
         "case_ids": [c1, c2, c3, c4, c5, c6, c7, c8],
+        # 套件级默认重试：失败后再试 1 次（用例可单独覆盖，见「失败注入接口」）
+        "retry": {"max_attempts": 2, "backoff_ms": 100},
         "created_at": time.time(),
     }
     registry.store("suites").insert(suite)
+
+    # 演示用例级覆盖：该用例必失败（/api/error），重试 3 次仍失败，
+    # 报告中可看到完整的逐轮尝试记录
+    registry.store("cases").update(c6, {
+        "retry": {"max_attempts": 3, "backoff_ms": 50,
+                  "retry_on": ["failed", "error", "timeout"]},
+    })
 
     registry.store("schedules").insert({
         "id": new_id("sch"),

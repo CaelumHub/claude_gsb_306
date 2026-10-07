@@ -17,6 +17,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from engine import new_id
 from engine.executor import TestExecutor
+from engine.retry import resolve_policy
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -63,6 +64,16 @@ def _payload() -> dict:
 
 def _err(msg: str, code: int = 400):
     return jsonify({"error": msg}), code
+
+
+def _check_retry(value):
+    """校验 retry 配置：只能是 None（不配置 / 清除）或 dict（策略对象）。
+
+    字段值的合法性在 :func:`engine.retry.resolve_policy` 解析时统一清洗，
+    这里只保证结构类型，并原样保留用户写了哪些字段——字段级覆盖优先级
+    （用例 > 套件）依赖「用户没写的字段不出现在存储里」。
+    """
+    return value is None or isinstance(value, dict)
 
 
 def _store(name: str):
@@ -190,6 +201,8 @@ def create_case(project_id: str):
     steps = data.get("steps") or []
     if not isinstance(steps, list):
         return _err("steps 必须是数组")
+    if not _check_retry(data.get("retry")):
+        return _err("retry 必须是对象（重试策略）")
     case = {
         "id": new_id("case"),
         "project_id": project_id,
@@ -200,6 +213,7 @@ def create_case(project_id: str):
         "timeout": int(data.get("timeout", 60)),
         "enabled": bool(data.get("enabled", True)),
         "steps": steps,
+        "retry": data.get("retry"),
         "created_at": time.time(),
     }
     _store("cases").insert(case)
@@ -220,8 +234,11 @@ def update_case(case_id: str):
     if case is None:
         return _err("用例不存在", 404)
     data = _payload()
+    if "retry" in data and not _check_retry(data.get("retry")):
+        return _err("retry 必须是对象（重试策略）；传 null 可清除用例级配置")
     patch = {}
-    for k in ("name", "description", "priority", "tags", "timeout", "enabled", "steps"):
+    for k in ("name", "description", "priority", "tags", "timeout", "enabled",
+              "steps", "retry"):
         if k in data:
             patch[k] = data[k]
     updated = _store("cases").update(case_id, patch)
@@ -236,14 +253,17 @@ def delete_case(case_id: str):
 
 @api.post("/cases/<case_id>/run")
 def run_single_case(case_id: str):
-    """单条用例试跑（同步执行，立即返回结果）。"""
+    """单条用例试跑（同步执行，立即返回结果；应用用例自身的重试策略）。"""
     case = _store("cases").get(case_id)
     if case is None:
         return _err("用例不存在", 404)
     data = _payload()
-    env_config = _env_mgr().to_executor_config(data.get("env_id")) if data.get("env_id") else {}
-    result = TestExecutor().execute_case(case, env_config,
-                                         timeout=case.get("timeout", 60))
+    env_id = data.get("env_id")
+    env_config = _env_mgr().to_executor_config(env_id) if env_id else {}
+    policy = resolve_policy(case.get("retry"), None)
+    result = TestExecutor().execute_with_retry(
+        case, env_config, policy=policy, env_id=env_id,
+        timeout=case.get("timeout", 60))
     return jsonify(result)
 
 
@@ -271,6 +291,8 @@ def create_suite(project_id: str):
     name = (data.get("name") or "").strip()
     if not name:
         return _err("套件名称不能为空")
+    if not _check_retry(data.get("retry")):
+        return _err("retry 必须是对象（套件默认重试策略）")
     suite = {
         "id": new_id("suite"),
         "project_id": project_id,
@@ -279,6 +301,7 @@ def create_suite(project_id: str):
         "group": data.get("group", ""),
         "case_ids": data.get("case_ids") or [],
         "env_id": data.get("env_id"),
+        "retry": data.get("retry"),
         "created_at": time.time(),
     }
     _store("suites").insert(suite)
@@ -299,7 +322,10 @@ def update_suite(suite_id: str):
     if suite is None:
         return _err("套件不存在", 404)
     data = _payload()
-    patch = {k: data[k] for k in ("name", "description", "group", "case_ids", "env_id")
+    if "retry" in data and not _check_retry(data.get("retry")):
+        return _err("retry 必须是对象（套件默认重试策略）；传 null 可清除")
+    patch = {k: data[k] for k in ("name", "description", "group", "case_ids",
+                                  "env_id", "retry")
              if k in data}
     updated = _store("suites").update(suite_id, patch)
     return jsonify(updated)

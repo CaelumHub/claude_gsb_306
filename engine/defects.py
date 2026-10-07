@@ -4,15 +4,26 @@
 缺陷保留来源（``source_case_id`` / ``source_build_id``），方便从报告页跳回
 缺陷页闭环处理。
 
+与自动重试的一致性
+------------------
+自动建缺陷只看用例的**最终结论**（重试后转绿的不建缺陷）；构建结束时还会
+把本次构建中最终通过的用例对应的、此前自动创建且未闭环的缺陷标记为
+``fixed``（:meth:`DefectManager.auto_resolve_passed`）——这样「报告里说它
+过了、缺陷列表却还挂着它」的自相矛盾不会出现。
+
 状态流：``open -> in_progress -> fixed -> verified -> closed``，
 以及 ``reopened`` 用于重新打开。
 """
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from .models import DEFECT_STATUSES, SEVERITIES, new_id
+
+# 可被「构建通过」自动闭环的状态
+_AUTO_RESOLVABLE = ("open", "reopened", "in_progress")
 
 
 class DefectManager:
@@ -36,13 +47,14 @@ class DefectManager:
             "source_build_id": payload.get("source_build_id"),
             "assignee": payload.get("assignee", ""),
             "tags": payload.get("tags") or [],
+            "auto": bool(payload.get("auto", False)),
         }
         self._store.insert(defect)
         return defect
 
     def create_from_case(self, project_id: str, case_result: dict,
                          build_id: str) -> Optional[dict]:
-        """从失败的用例结果自动生成缺陷。"""
+        """从失败的用例结果自动生成缺陷（只看最终结论）。"""
         if case_result.get("status") not in ("failed", "error", "timeout"):
             return None
         reason = ""
@@ -55,13 +67,44 @@ class DefectManager:
                 if s.get("status") in ("failed", "error"):
                     reason = s.get("message", "")
                     break
+        if case_result.get("retried"):
+            reason = f"（重试 {case_result.get('attempt_count', 1)} 次后仍失败）" + (reason or "用例执行失败，请查看构建日志。")
         return self.create(project_id, {
             "title": f"[自动] 用例失败: {case_result.get('case_name')}",
             "description": reason or "用例执行失败，请查看构建日志。",
             "severity": "major" if case_result.get("priority") in ("P0", "P1") else "minor",
             "source_case_id": case_result.get("case_id"),
             "source_build_id": build_id,
+            "auto": True,
         })
+
+    def auto_resolve_passed(self, project_id: str, case_ids: list,
+                            build_id: str) -> list[dict]:
+        """把本次构建中最终通过的用例对应的自动缺陷标记为 ``fixed``。
+
+        只处理自动创建（``auto``）且仍在流转中的缺陷；手动创建的缺陷即使
+        关联同一用例也不动，避免误关人工跟进的单子。返回被闭环的缺陷列表。
+        """
+        if not case_ids:
+            return []
+        wanted = set(case_ids)
+        resolved = []
+        for d in self.list(project_id):
+            if not d.get("auto"):
+                continue
+            if d.get("source_case_id") not in wanted:
+                continue
+            if d.get("status") not in _AUTO_RESOLVABLE:
+                continue
+            updated = self.update(d["id"], {
+                "status": "fixed",
+                "resolved_build_id": build_id,
+                "resolved_at": time.time(),
+                "resolution": "用例在构建中重试后通过 / 已通过，自动闭环",
+            })
+            if updated:
+                resolved.append(updated)
+        return resolved
 
     def list(self, project_id: str, status: str = None,
              severity: str = None) -> list[dict]:

@@ -11,6 +11,7 @@
 - :mod:`engine.defects`     缺陷跟踪
 - :mod:`engine.notify`      通知与集成
 - :mod:`engine.scheduler`   并发调度（构建池 + 用例池 + 定时触发循环）
+- :mod:`engine.retry`       失败自动重试（策略模型 / 优先级解析 / 重试判定）
 """
 
 from .models import (
@@ -27,6 +28,8 @@ from .coverage import CoverageAnalyzer
 from .report import ReportGenerator
 from .defects import DefectManager
 from .notify import NotificationManager
+from .retry import (DEFAULT_RETRY_POLICY, RETRYABLE_STATUSES,
+                    normalize_policy, resolve_policy, should_retry)
 from .scheduler import Scheduler
 
 __all__ = [
@@ -46,4 +49,9 @@ __all__ = [
     "DefectManager",
     "NotificationManager",
     "Scheduler",
+    "DEFAULT_RETRY_POLICY",
+    "RETRYABLE_STATUSES",
+    "normalize_policy",
+    "resolve_policy",
+    "should_retry",
 ]
