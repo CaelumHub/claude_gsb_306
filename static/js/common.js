@@ -115,6 +115,16 @@ function statusBadge(status) {
   return badge(status, STATUS_LABELS[status] || status);
 }
 
+/* 重试角标：
+   - 重试后转绿（flaky）→ 醒目的琥珀色「重试 N 次后通过」
+   - 重试后仍失败       → 中性灰「重试 N 次」 */
+function retryBadge(r) {
+  if (!r || !(r.retry_count > 0)) return "";
+  if (r.flaky)
+    return `<span class="badge flaky" title="首轮失败，重试后通过（用例存在抖动）">↻ 重试 ${r.retry_count} 次后通过</span>`;
+  return `<span class="badge retried" title="共执行 ${r.attempts || r.retry_count + 1} 轮">↻ 重试 ${r.retry_count} 次</span>`;
+}
+
 function priorityBadge(p) {
   return `<span class="tag">${esc(PRIORITY_LABELS[p] || p || "P2")}</span>`;
 }

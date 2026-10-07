@@ -26,6 +26,7 @@ from typing import Optional
 
 from .cron import cron_matches, parse_cron
 from .models import new_id
+from .retry import describe_policy, merge_policy, normalize_policy, run_with_retry
 
 
 class Scheduler:
@@ -112,7 +113,8 @@ class Scheduler:
             }
 
         self._build_pool.submit(
-            self._run_build, project_id, build_id, cases, env_id, cancel_event)
+            self._run_build, project_id, build_id, cases, suite, env_id,
+            cancel_event)
 
         # 若是定时触发，记录一次计划运行历史
         if schedule_id:
@@ -146,12 +148,15 @@ class Scheduler:
 
     # ------------------------------------------------------------------ 构建执行
     def _run_build(self, project_id: str, build_id: str, cases: list,
-                   env_id: str, cancel_event: threading.Event) -> None:
+                   suite: dict, env_id: str, cancel_event: threading.Event) -> None:
         store = self.builds.for_project(project_id)
         env_config = self.env_manager.to_executor_config(env_id)
+        suite_policy = suite.get("retry_policy")
         store.set_total(build_id, len(cases))
         store.append_log(build_id, f"构建 {build_id} 开始，共 {len(cases)} 个用例，"
                                    f"环境 {env_id}")
+        store.append_log(build_id, f"套件默认重试策略：{describe_policy(suite_policy)}"
+                                   f"（用例可按字段单独覆盖，用例配置优先）")
 
         case_workers = max(1, min(self.max_case_workers, len(cases)))
         try:
@@ -163,7 +168,7 @@ class Scheduler:
                         break
                     futures[pool.submit(
                         self._run_one, case, env_config, env_id, i,
-                        cancel_event)] = case
+                        suite_policy, cancel_event)] = case
 
                 for future in as_completed(futures):
                     case = futures[future]
@@ -176,6 +181,10 @@ class Scheduler:
                             "group": (case.get("tags") or ["默认"])[0],
                             "priority": case.get("priority", "P3"),
                             "status": "error",
+                            "first_status": "error",
+                            "flaky": False,
+                            "retry_count": 0,
+                            "attempts": 1,
                             "duration": 0.0,
                             "steps": [],
                             "assertions": [],
@@ -192,6 +201,10 @@ class Scheduler:
                             "group": (case.get("tags") or ["默认"])[0],
                             "priority": case.get("priority", "P3"),
                             "status": "skipped",
+                            "first_status": "skipped",
+                            "flaky": False,
+                            "retry_count": 0,
+                            "attempts": 1,
                             "duration": 0.0,
                             "steps": [], "assertions": [],
                             "logs": ["因取消而未执行"],
@@ -210,7 +223,9 @@ class Scheduler:
             status = "failed"
         store.finish(build_id, status)
         store.append_log(build_id, f"构建结束: {status}（通过 {build.get('passed', 0)}"
-                                   f"/{build.get('total', 0)}）")
+                                   f"/{build.get('total', 0)}，"
+                                   f"重试后转绿 {build.get('flaky', 0)} 条，"
+                                   f"累计重试 {build.get('retry_count', 0)} 次）")
 
         # 收尾：报告 + 覆盖率 + 通知 + 自动缺陷
         self._finalize(project_id, build_id)
@@ -219,12 +234,22 @@ class Scheduler:
             self._running.pop(build_id, None)
 
     def _run_one(self, case: dict, env_config: dict, env_id: str,
-                 index: int, cancel_event: threading.Event) -> dict:
-        result = self.executor.execute_case(
-            case, env_config, cancel_event=cancel_event,
-            timeout=case.get("timeout", 60))
+                 index: int, suite_policy: Optional[dict],
+                 cancel_event: threading.Event) -> dict:
+        # 重试策略：用例 retry_policy 字段级覆盖套件默认策略（执行时解析，
+        # 与配置先后无关）。重试在本 worker 线程内串行完成，不额外占用池名额。
+        policy = merge_policy(suite_policy, case.get("retry_policy"))
+
+        def _execute(_attempt: int) -> dict:
+            return self.executor.execute_case(
+                case, env_config, cancel_event=cancel_event,
+                timeout=case.get("timeout", 60))
+
+        result = run_with_retry(_execute, policy, env_id=env_id,
+                                cancel_event=cancel_event)
         result["env_id"] = env_id
         result["order"] = index
+        result["retry_policy"] = normalize_policy(policy)
         return result
 
     def _persist_result(self, store, build_id: str, case: dict, result: dict) -> None:
@@ -252,8 +277,11 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             pass
 
-        # 通知
+        # 通知（通过率按最终结果；额外带上首轮口径与抖动转绿数）
         event = "build.passed" if build["status"] == "passed" else "build.failed"
+        first_finished = total - build.get("skipped", 0)
+        first_passed = build.get("first_passed", 0)
+        first_pass_rate = round(first_passed / first_finished * 100, 1) if first_finished else 100.0
         payload = {
             "build_id": build_id,
             "project_id": project_id,
@@ -261,12 +289,16 @@ class Scheduler:
             "passed": passed,
             "total": total,
             "pass_rate": round(passed_ratio * 100, 1),
+            "first_pass_rate": first_pass_rate,
+            "flaky": build.get("flaky", 0),
+            "retry_count": build.get("retry_count", 0),
             "duration": build.get("duration", 0.0),
         }
         self.notify.fire(project_id, "build.finished", payload)
         self.notify.fire(project_id, event, payload)
 
-        # 自动缺陷（项目配置开启时，把失败用例转成缺陷）
+        # 自动缺陷（项目配置开启时，把**最终仍失败**的用例转成缺陷）。
+        # 重试后转绿（flaky）的用例不建缺陷，保证报告「过了」与缺陷列表不矛盾。
         project = self.registry.store("projects").get(project_id)
         if project and project.get("auto_create_defects"):
             failures = store.results(build_id, where=[("status", "in", ["failed", "error", "timeout"])])

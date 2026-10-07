@@ -17,6 +17,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from engine import new_id
 from engine.executor import TestExecutor
+from engine.retry import RetryConfigError, merge_policy, normalize_policy, run_with_retry
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -67,6 +68,22 @@ def _err(msg: str, code: int = 400):
 
 def _store(name: str):
     return _registry().store(name)
+
+
+def _retry_policy_from_payload(data: dict):
+    """从请求中取并重试策略并校验；返回 (policy, error_response)。
+
+    缺失时返回 ``(None, None)``，表示该实体不单独配置（跟随套件默认）。
+    """
+    if "retry_policy" not in data:
+        return None, None
+    raw = data.get("retry_policy")
+    if raw in (None, {}):
+        return {}, None  # 显式空对象 = 不单独配置
+    try:
+        return normalize_policy(raw), None
+    except RetryConfigError as exc:
+        return None, _err(str(exc))
 
 
 def _build_or_404(build_id: str):
@@ -190,6 +207,9 @@ def create_case(project_id: str):
     steps = data.get("steps") or []
     if not isinstance(steps, list):
         return _err("steps 必须是数组")
+    retry_policy, err = _retry_policy_from_payload(data)
+    if err:
+        return err
     case = {
         "id": new_id("case"),
         "project_id": project_id,
@@ -202,6 +222,8 @@ def create_case(project_id: str):
         "steps": steps,
         "created_at": time.time(),
     }
+    if retry_policy is not None:
+        case["retry_policy"] = retry_policy
     _store("cases").insert(case)
     return jsonify(case)
 
@@ -224,6 +246,11 @@ def update_case(case_id: str):
     for k in ("name", "description", "priority", "tags", "timeout", "enabled", "steps"):
         if k in data:
             patch[k] = data[k]
+    if "retry_policy" in data:
+        retry_policy, err = _retry_policy_from_payload(data)
+        if err:
+            return err
+        patch["retry_policy"] = retry_policy
     updated = _store("cases").update(case_id, patch)
     return jsonify(updated)
 
@@ -236,14 +263,21 @@ def delete_case(case_id: str):
 
 @api.post("/cases/<case_id>/run")
 def run_single_case(case_id: str):
-    """单条用例试跑（同步执行，立即返回结果）。"""
+    """单条用例试跑（同步执行，立即返回结果；按用例自身重试策略重试）。"""
     case = _store("cases").get(case_id)
     if case is None:
         return _err("用例不存在", 404)
     data = _payload()
-    env_config = _env_mgr().to_executor_config(data.get("env_id")) if data.get("env_id") else {}
-    result = TestExecutor().execute_case(case, env_config,
-                                         timeout=case.get("timeout", 60))
+    env_id = data.get("env_id")
+    env_config = _env_mgr().to_executor_config(env_id) if env_id else {}
+    executor = TestExecutor()
+
+    def _execute(_attempt: int) -> dict:
+        return executor.execute_case(case, env_config,
+                                     timeout=case.get("timeout", 60))
+
+    # 试跑不经过套件，因此只用用例自身配置的重试策略（未配置即不重试）
+    result = run_with_retry(_execute, case.get("retry_policy"), env_id=env_id)
     return jsonify(result)
 
 
@@ -271,6 +305,9 @@ def create_suite(project_id: str):
     name = (data.get("name") or "").strip()
     if not name:
         return _err("套件名称不能为空")
+    retry_policy, err = _retry_policy_from_payload(data)
+    if err:
+        return err
     suite = {
         "id": new_id("suite"),
         "project_id": project_id,
@@ -281,6 +318,8 @@ def create_suite(project_id: str):
         "env_id": data.get("env_id"),
         "created_at": time.time(),
     }
+    if retry_policy is not None:
+        suite["retry_policy"] = retry_policy
     _store("suites").insert(suite)
     return jsonify(suite)
 
@@ -301,6 +340,11 @@ def update_suite(suite_id: str):
     data = _payload()
     patch = {k: data[k] for k in ("name", "description", "group", "case_ids", "env_id")
              if k in data}
+    if "retry_policy" in data:
+        retry_policy, err = _retry_policy_from_payload(data)
+        if err:
+            return err
+        patch["retry_policy"] = retry_policy
     updated = _store("suites").update(suite_id, patch)
     return jsonify(updated)
 

@@ -67,6 +67,14 @@ class ReportGenerator:
         finished = total - skipped
         pass_rate = round(passed / finished * 100, 1) if finished else 0.0
 
+        # 首轮口径：若构建没有重试统计（旧数据），首轮 == 最终
+        first_passed = build.get("first_passed", passed)
+        first_failed = build.get("first_failed",
+                                 failed + error + timeout)
+        first_pass_rate = round(first_passed / finished * 100, 1) if finished else 0.0
+        flaky = build.get("flaky", 0)
+        retry_count = build.get("retry_count", 0)
+
         durations = build.get("durations", [])
         report = {
             "build_id": build_id,
@@ -87,6 +95,13 @@ class ReportGenerator:
                 "skipped": skipped,
                 "timeout": timeout,
                 "pass_rate": pass_rate,
+                # 首轮结果与「重试后转绿」数，让团队既看到最终结论，
+                # 也能判断构建的真实稳定性（多少绿是靠重试救回来的）
+                "first_passed": first_passed,
+                "first_failed": first_failed,
+                "first_pass_rate": first_pass_rate,
+                "flaky": flaky,
+                "retry_count": retry_count,
             },
             "durations": {
                 "avg": round(statistics.mean(durations), 3) if durations else 0.0,
@@ -100,6 +115,7 @@ class ReportGenerator:
             "by_priority": build.get("by_priority", {}),
             "slowest": self._slowest(store, build_id, 10),
             "failures": self._failures(store, build_id, 50),
+            "flaky_cases": self._flaky(store, build_id, 50),
             "generated_at": time.time(),
         }
         return report
@@ -127,8 +143,31 @@ class ReportGenerator:
                 "group": r.get("group"),
                 "priority": r.get("priority"),
                 "duration": r.get("duration"),
+                "retry_count": r.get("retry_count", 0),
+                "attempts": r.get("attempts", 1),
                 "reason": (failing_assert or {}).get("message")
                 or (failing_step or {}).get("message") or r.get("message") or "",
+            })
+        return out
+
+    def _flaky(self, store, build_id: str, top: int) -> list[dict]:
+        """首轮失败、重试后转绿的用例清单（构建稳定性的重要信号）。"""
+        records = store.results(build_id, where=[("flaky", "eq", True)], limit=top)
+        out = []
+        for r in records:
+            first_round = (r.get("rounds") or [{}])[0]
+            first_assert = next((a for a in first_round.get("assertions", [])
+                                 if not a.get("ok")), None)
+            out.append({
+                "case_id": r.get("case_id"),
+                "case_name": r.get("case_name"),
+                "group": r.get("group"),
+                "priority": r.get("priority"),
+                "first_status": r.get("first_status"),
+                "retry_count": r.get("retry_count", 0),
+                "attempts": r.get("attempts", 1),
+                "duration": r.get("duration"),
+                "first_reason": (first_assert or {}).get("message", ""),
             })
         return out
 
@@ -139,6 +178,7 @@ class ReportGenerator:
         points = []
         for b in reversed(builds):
             finished = b.get("total", 0) - b.get("skipped", 0)
+            first_passed = b.get("first_passed", b.get("passed", 0))
             points.append({
                 "build_id": b["id"],
                 "name": b.get("name") or b["id"],
@@ -148,6 +188,9 @@ class ReportGenerator:
                 "passed": b.get("passed", 0),
                 "failed": b.get("failed", 0) + b.get("error", 0) + b.get("timeout", 0),
                 "pass_rate": round(b.get("passed", 0) / finished * 100, 1) if finished else 0,
+                "first_pass_rate": round(first_passed / finished * 100, 1) if finished else 0,
+                "flaky": b.get("flaky", 0),
+                "retry_count": b.get("retry_count", 0),
                 "duration": b.get("duration", 0.0),
                 "finished_at": b.get("finished_at"),
             })
@@ -160,9 +203,10 @@ class ReportGenerator:
     def _aggregate(self, builds: list[dict]) -> dict:
         if not builds:
             return {"total_builds": 0, "avg_pass_rate": 0.0, "avg_duration": 0.0,
-                    "total_passed": 0, "total_cases": 0}
+                    "total_passed": 0, "total_cases": 0, "total_flaky": 0,
+                    "total_retries": 0}
         rates, durations = [], []
-        tp = tc = 0
+        tp = tc = flaky = retries = 0
         for b in builds:
             finished = b.get("total", 0) - b.get("skipped", 0)
             if finished:
@@ -171,10 +215,14 @@ class ReportGenerator:
                 durations.append(b["duration"])
             tp += b.get("passed", 0)
             tc += b.get("total", 0)
+            flaky += b.get("flaky", 0)
+            retries += b.get("retry_count", 0)
         return {
             "total_builds": len(builds),
             "avg_pass_rate": round(statistics.mean(rates), 1) if rates else 0.0,
             "avg_duration": round(statistics.mean(durations), 3) if durations else 0.0,
             "total_passed": tp,
             "total_cases": tc,
+            "total_flaky": flaky,
+            "total_retries": retries,
         }

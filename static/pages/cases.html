@@ -77,6 +77,37 @@
           </label>
         </div>
 
+        <div class="mt" style="border:1px dashed var(--border);border-radius:10px;padding:12px 14px">
+          <label style="display:inline-flex;gap:6px;font-weight:600;color:var(--text);align-items:center">
+            <input type="checkbox" id="c-retry-on" style="width:auto"> 单独配置自动重试
+          </label>
+          <div class="muted" style="font-size:12px;margin:4px 0 8px">
+            不勾选则跟随所属套件的默认策略；勾选后本用例的字段覆盖套件默认（用例配置优先），重试次数设为 0 即显式关闭。
+          </div>
+          <div id="retry-editor" style="display:none">
+            <div class="grid cols-3 mt">
+              <div><label>失败后最多重试次数</label>
+                <input type="number" id="r-max" min="0" max="5" value="2"></div>
+              <div><label>重试前等待（毫秒）</label>
+                <input type="number" id="r-backoff" min="0" step="50" value="200"></div>
+              <div><label>重试总预算（毫秒，0=不限）</label>
+                <input type="number" id="r-budget" min="0" step="100" value="0"></div>
+            </div>
+            <div class="grid cols-2 mt">
+              <div><label>仅这些结果状态才重试</label>
+                <div id="r-statuses" style="display:flex;gap:12px;padding-top:6px;font-weight:400">
+                  <label style="font-size:13px"><input type="checkbox" class="r-status" value="failed" checked style="width:auto"> 断言失败</label>
+                  <label style="font-size:13px"><input type="checkbox" class="r-status" value="error" checked style="width:auto"> 执行错误</label>
+                  <label style="font-size:13px"><input type="checkbox" class="r-status" value="timeout" checked style="width:auto"> 超时</label>
+                </div></div>
+              <div><label>仅在这些环境重试（不选 = 任意环境）</label>
+                <select id="r-envs" multiple size="3" style="min-height:64px"></select></div>
+            </div>
+            <div class="mt"><label>仅这些断言类型失败时重试（不选 = 不限制，按住 Ctrl 多选）</label>
+              <select id="r-asserts" multiple size="3" style="min-height:64px"></select></div>
+          </div>
+        </div>
+
         <div class="mt">
           <label>步骤与断言</label>
           <div class="step-btns">
@@ -107,15 +138,82 @@ let projectId = null;
 let cases = [];
 let currentId = null;
 let steps = [];
+let envOptions = [];
+
+// ---------- 重试策略 ----------
+function initRetryEditor() {
+  $("#r-asserts").innerHTML = ASSERT_TYPES
+    .map(t => `<option value="${t}">${t}</option>`).join("");
+  $("#c-retry-on").onchange = () => {
+    $("#retry-editor").style.display = $("#c-retry-on").checked ? "block" : "none";
+  };
+}
+
+async function loadRetryEnvs() {
+  if (!projectId) { envOptions = []; return; }
+  const d = await api(`/api/projects/${projectId}/environments`);
+  envOptions = d.environments || [];
+  const cur = Array.from($("#r-envs").selectedOptions).map(o => o.value);
+  $("#r-envs").innerHTML = envOptions
+    .map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join("");
+  Array.from($("#r-envs").options).forEach(o => { if (cur.includes(o.value)) o.selected = true; });
+}
+
+function resetRetryEditor() {
+  $("#c-retry-on").checked = false;
+  $("#retry-editor").style.display = "none";
+  $("#r-max").value = "2"; $("#r-backoff").value = "200"; $("#r-budget").value = "0";
+  $$(".r-status").forEach(cb => { cb.checked = true; });
+  $("#r-asserts").selectedIndex = -1;
+  loadRetryEnvs();
+}
+
+function fillRetryEditor(policy) {
+  if (policy && typeof policy === "object" && Object.keys(policy).length) {
+    $("#c-retry-on").checked = true;
+    $("#retry-editor").style.display = "block";
+    $("#r-max").value = policy.max_retries ?? 0;
+    $("#r-backoff").value = policy.backoff_ms ?? 200;
+    $("#r-budget").value = policy.retry_budget_ms ?? 0;
+    const statuses = (policy.retry_on_status && policy.retry_on_status.length)
+      ? policy.retry_on_status : ["failed","error","timeout"];
+    $$(".r-status").forEach(cb => { cb.checked = statuses.includes(cb.value); });
+    const asserts = policy.retry_on_assertions || [];
+    Array.from($("#r-asserts").options).forEach(o => { o.selected = asserts.includes(o.value); });
+    loadRetryEnvs().then(() => {
+      const envs = policy.env_ids || [];
+      Array.from($("#r-envs").options).forEach(o => { o.selected = envs.includes(o.value); });
+    });
+  } else {
+    resetRetryEditor();
+  }
+}
+
+function readRetryPolicy() {
+  if (!$("#c-retry-on").checked) return undefined;  // 未勾选 = 跟随套件
+  return {
+    max_retries: parseInt($("#r-max").value || "0", 10),
+    backoff_ms: parseFloat($("#r-backoff").value || "0"),
+    retry_budget_ms: parseFloat($("#r-budget").value || "0"),
+    retry_on_status: $$(".r-status").filter(cb => cb.checked).map(cb => cb.value),
+    retry_on_assertions: Array.from($("#r-asserts").selectedOptions).map(o => o.value),
+    env_ids: Array.from($("#r-envs").selectedOptions).map(o => o.value),
+  };
+}
 
 // ---------- 项目 ----------
 async function init() {
+  initRetryEditor();
   const params = new URLSearchParams(location.search);
   projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
+  await loadRetryEnvs();
   await loadCases();
 }
 
-async function switchProject(id) { projectId = id; currentId = null; steps = []; resetEditor(); await loadCases(); }
+async function switchProject(id) {
+  projectId = id; currentId = null; steps = []; resetEditor();
+  await loadRetryEnvs(); await loadCases();
+}
 
 async function loadTags() {
   if (!projectId) return;
@@ -139,7 +237,9 @@ async function loadCases() {
   if (!cases.length) { host.innerHTML = '<div class="empty">暂无用例</div>'; return; }
   host.innerHTML = cases.map(c => `
     <div class="case-item ${c.id === currentId ? 'active' : ''}" onclick="loadCase('${c.id}')">
-      <div class="cname">${esc(c.name)}</div>
+      <div class="cname">${esc(c.name)}
+        ${(c.retry_policy && (c.retry_policy.max_retries ?? 0) > 0)
+          ? `<span class="badge retried" style="margin-left:6px">↻ 重试×${c.retry_policy.max_retries}</span>` : ""}</div>
       <div class="cmeta">${priorityBadge(c.priority)} ${tagsHtml(c.tags)}
         <span style="margin-left:6px">${(c.steps||[]).length} 步</span></div>
     </div>`).join("");
@@ -153,6 +253,7 @@ function resetEditor() {
   $("#c-tags").value = ""; $("#c-enabled").checked = true;
   $("#editor-title").textContent = "新建用例";
   $("#btn-delete").style.display = "none";
+  resetRetryEditor();
   renderSteps();
 }
 
@@ -166,6 +267,7 @@ async function loadCase(id) {
   $("#editor-title").textContent = "编辑用例";
   $("#btn-delete").style.display = "inline-flex";
   steps = (c.steps || []).map(s => ({ ...s }));
+  fillRetryEditor(c.retry_policy);
   renderSteps();
   $$(".case-item").forEach(el => el.classList.remove("active"));
   const idx = cases.findIndex(x => x.id === id);
@@ -277,7 +379,7 @@ function serializeSteps() {
 }
 
 function readEditor() {
-  return {
+  const out = {
     name: $("#c-name").value.trim(),
     description: $("#c-desc").value,
     priority: $("#c-priority").value,
@@ -286,6 +388,9 @@ function readEditor() {
     enabled: $("#c-enabled").checked,
     steps: serializeSteps(),
   };
+  const policy = readRetryPolicy();
+  if (policy !== undefined) out.retry_policy = policy;
+  return out;
 }
 
 $("#btn-new").onclick = () => { resetEditor(); };

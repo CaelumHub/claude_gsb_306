@@ -28,6 +28,9 @@ from .report import ReportGenerator
 from .defects import DefectManager
 from .notify import NotificationManager
 from .scheduler import Scheduler
+from .retry import (MAX_MAX_RETRIES, RETRYABLE_STATUSES, RetryConfigError,
+                    backoff_seconds, describe_policy, merge_policy,
+                    normalize_policy, run_with_retry, should_retry)
 
 __all__ = [
     "PRIORITIES",
@@ -46,4 +49,13 @@ __all__ = [
     "DefectManager",
     "NotificationManager",
     "Scheduler",
+    "MAX_MAX_RETRIES",
+    "RETRYABLE_STATUSES",
+    "RetryConfigError",
+    "backoff_seconds",
+    "describe_policy",
+    "merge_policy",
+    "normalize_policy",
+    "run_with_retry",
+    "should_retry",
 ]

@@ -66,6 +66,11 @@ def _empty_build(build_id: str, project_id: str, **kw: Any) -> dict:
         "error": 0,
         "skipped": 0,
         "timeout": 0,
+        # 重试统计：first_* 按首轮结果计数；flaky = 首轮失败、重试后转绿
+        "first_passed": 0,
+        "first_failed": 0,
+        "flaky": 0,
+        "retry_count": 0,
         "started_at": None,
         "finished_at": None,
         "duration": 0.0,
@@ -195,23 +200,35 @@ class BuildStore:
             status = result.get("status", "error")
             if status in ("passed", "failed", "error", "skipped", "timeout"):
                 build[status] = build.get(status, 0) + 1
+            # 首轮口径（含重试的构建可同时给出「首轮通过率」与「最终通过率」）
+            first_status = result.get("first_status", status)
+            if first_status == "passed":
+                build["first_passed"] = build.get("first_passed", 0) + 1
+            elif first_status in ("failed", "error", "timeout"):
+                build["first_failed"] = build.get("first_failed", 0) + 1
+            if result.get("flaky"):
+                build["flaky"] = build.get("flaky", 0) + 1
+            build["retry_count"] = build.get("retry_count", 0) + int(result.get("retry_count", 0))
             build["durations"] = build.get("durations", []) + [result.get("duration", 0.0)]
 
             group = result.get("group") or "默认"
             gp = build.setdefault("by_group", {})
             entry = gp.setdefault(group, {"total": 0, "passed": 0, "failed": 0,
                                           "error": 0, "skipped": 0, "timeout": 0,
-                                          "duration": 0.0})
+                                          "flaky": 0, "duration": 0.0})
             entry["total"] += 1
             entry[status if status in entry else "error"] += 1
+            entry["flaky"] = entry.get("flaky", 0) + (1 if result.get("flaky") else 0)
             entry["duration"] = round(entry["duration"] + result.get("duration", 0.0), 3)
 
             priority = result.get("priority") or "P3"
             pp = build.setdefault("by_priority", {})
             pe = pp.setdefault(priority, {"total": 0, "passed": 0, "failed": 0,
-                                          "error": 0, "skipped": 0, "timeout": 0})
+                                          "error": 0, "skipped": 0, "timeout": 0,
+                                          "flaky": 0})
             pe["total"] += 1
             pe[status if status in pe else "error"] += 1
+            pe["flaky"] = pe.get("flaky", 0) + (1 if result.get("flaky") else 0)
 
             # 2) 结果落分片
             meta = read_json(self._results_meta_path(build_id), {"shard_count": 0, "total": 0})

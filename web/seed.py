@@ -93,6 +93,9 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         {"action": "request", "method": "GET", "url": "/api/error", "name": "请求失败接口"},
         {"action": "assert", "type": "status", "actual": "${resp.status}", "expected": 200, "name": "期望 200"},
     ])
+    # 该用例是确定性失败（路径含 error 必返回 500），即使套件默认开启重试，
+    # 这里显式 max_retries=0 单独关闭，演示「用例配置优先于套件默认」。
+    registry.store("cases").update(c6, {"retry_policy": {"max_retries": 0}})
     c7 = _case("字符串断言", "P2", ["unit"], [
         {"action": "script", "expr": "2 + 3 * 4", "save_as": "result", "name": "算术"},
         {"action": "assert", "type": "equals", "actual": "${result}", "expected": 14, "name": "结果等于 14"},
@@ -111,6 +114,17 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "group": "smoke",
         "env_id": env["id"],
         "case_ids": [c1, c2, c3, c4, c5, c6, c7, c8],
+        # 套件默认重试：首轮失败后最多自动重试 1 次，退避 200ms
+        "retry_policy": {
+            "max_retries": 1,
+            "retry_on_status": ["failed", "error", "timeout"],
+            "retry_on_assertions": [],
+            "env_ids": [],
+            "backoff_ms": 200,
+            "backoff_factor": 1.5,
+            "max_backoff_ms": 2000,
+            "retry_budget_ms": 0,
+        },
         "created_at": time.time(),
     }
     registry.store("suites").insert(suite)

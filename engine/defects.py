@@ -42,7 +42,11 @@ class DefectManager:
 
     def create_from_case(self, project_id: str, case_result: dict,
                          build_id: str) -> Optional[dict]:
-        """从失败的用例结果自动生成缺陷。"""
+        """从失败的用例结果自动生成缺陷。
+
+        只看**最终状态**：重试后转绿（``flaky``）的用例最终状态为 passed，
+        这里直接跳过，保证「报告说过了」与「缺陷列表挂着它」不会同时发生。
+        """
         if case_result.get("status") not in ("failed", "error", "timeout"):
             return None
         reason = ""
@@ -55,13 +59,28 @@ class DefectManager:
                 if s.get("status") in ("failed", "error"):
                     reason = s.get("message", "")
                     break
-        return self.create(project_id, {
+        retry_count = case_result.get("retry_count", 0)
+        attempts = case_result.get("attempts", retry_count + 1)
+        if retry_count:
+            retry_note = f"（自动重试 {retry_count} 次、共执行 {attempts} 轮后仍然失败）"
+        else:
+            retry_note = ""
+        defect = self.create(project_id, {
             "title": f"[自动] 用例失败: {case_result.get('case_name')}",
-            "description": reason or "用例执行失败，请查看构建日志。",
+            "description": (reason or "用例执行失败，请查看构建日志。") + retry_note,
             "severity": "major" if case_result.get("priority") in ("P0", "P1") else "minor",
             "source_case_id": case_result.get("case_id"),
             "source_build_id": build_id,
         })
+        if retry_count:
+            defect["retry_count"] = retry_count
+            defect["attempts"] = attempts
+            defect["flaky"] = bool(case_result.get("flaky"))
+            self._store.update(defect["id"], {
+                "retry_count": retry_count, "attempts": attempts,
+                "flaky": bool(case_result.get("flaky")),
+            })
+        return defect
 
     def list(self, project_id: str, status: str = None,
              severity: str = None) -> list[dict]:

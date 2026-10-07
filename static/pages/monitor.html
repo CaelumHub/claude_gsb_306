@@ -152,7 +152,7 @@ function renderResults(results, running) {
   if (!results.length) { host.innerHTML = '<div class="muted">' + (running ? "执行中，暂无结果…" : "无结果") + '</div>'; return; }
   host.innerHTML = `<div style="max-height:260px;overflow:auto">` + results.map(r => `
     <div class="result-item row spread">
-      <span>${esc(r.case_name||r.case_id)} ${statusBadge(r.status)}</span>
+      <span>${esc(r.case_name||r.case_id)} ${statusBadge(r.status)} ${retryBadge(r)}</span>
       <span class="mono muted" style="font-size:12px">${fmtDur(r.duration)}</span>
     </div>`).join("") + "</div>";
 }

@@ -90,7 +90,8 @@ async function loadTrend() {
     </div>`).join("") + "</div>";
   const agg = d.aggregate || {};
   host.insertAdjacentHTML("beforeend", `<div class="mt muted" style="font-size:13px">最近 ${agg.total_builds} 次构建 ·
-    平均通过率 <strong>${agg.avg_pass_rate}%</strong> · 平均耗时 <strong>${fmtDur(agg.avg_duration)}</strong></div>`);
+    平均最终通过率 <strong>${agg.avg_pass_rate}%</strong> · 平均耗时 <strong>${fmtDur(agg.avg_duration)}</strong>
+    · 重试后转绿 <strong>${agg.total_flaky||0}</strong> 条 · 累计重试 <strong>${agg.total_retries||0}</strong> 次</div>`);
 }
 
 async function loadBuilds() {
@@ -124,10 +125,14 @@ function renderReport(r) {
   $("#report-body").innerHTML = `
     <div class="grid cols-4 mt">
       <div class="stat primary"><div class="v">${s.total||0}</div><div class="k">总用例</div></div>
-      <div class="stat good"><div class="v">${s.pass_rate ?? 0}%</div><div class="k">通过率</div></div>
-      <div class="stat ${(s.failed||0)?'bad':'good'}"><div class="v">${(s.failed||0)+(s.error||0)+(s.timeout||0)}</div><div class="k">失败/错误/超时</div></div>
-      <div class="stat primary"><div class="v">${fmtDur(r.duration)}</div><div class="k">总耗时</div></div>
+      <div class="stat good"><div class="v">${s.pass_rate ?? 0}%</div><div class="k">最终通过率（重试后）</div></div>
+      <div class="stat ${(s.first_pass_rate??100) < 100 ? 'bad' : 'good'}">
+        <div class="v">${s.first_pass_rate ?? (s.pass_rate ?? 0)}%</div><div class="k">首轮通过率</div></div>
+      <div class="stat ${s.flaky?'':'good'}"><div class="v">${s.flaky||0}</div><div class="k">重试后转绿（抖动）</div></div>
     </div>
+    ${(s.flaky||s.retry_count) ? `<div class="muted mt" style="font-size:12.5px">
+      本构建共触发 <strong>${s.retry_count||0}</strong> 次自动重试；其中 ${s.flaky||0} 条用例首轮失败、重试后通过。
+      构建红绿以<span style="color:var(--green)">最终结果</span>为准，但首轮通过率反映了真实稳定性。</div>` : ""}
     <div class="mt row">
       ${statusBadge(r.status)}
       <span class="muted" style="font-size:13px">触发 ${esc(r.trigger||'manual')} · ${fmtTime(r.started_at)} → ${fmtTime(r.finished_at)}</span>
@@ -151,9 +156,19 @@ function renderReport(r) {
       <tbody>${prio.map(([g,v]) => `<tr><td>${priorityBadge(g)}</td><td>${v.total}</td><td style="color:var(--green)">${v.passed}</td>
         <td style="color:var(--red)">${(v.failed||0)+(v.error||0)+(v.timeout||0)}</td></tr>`).join("")}</tbody></table></div>` : ""}
 
-    ${failures.length ? `<div class="mt"><h3>失败明细</h3><table>
-      <thead><tr><th>用例</th><th>状态</th><th>原因</th><th>耗时</th></tr></thead>
+    ${flaky.length ? `<div class="mt"><h3>重试后转绿（抖动用例）</h3><table>
+      <thead><tr><th>用例</th><th>首轮状态</th><th>重试</th><th>首轮失败原因</th><th>总耗时</th></tr></thead>
+      <tbody>${flaky.map(f => `<tr style="background:#fffaf0">
+        <td>${esc(f.case_name||f.case_id)}</td>
+        <td>${statusBadge(f.first_status)}</td>
+        <td><span class="badge flaky">↻ ${f.retry_count} 次后通过</span></td>
+        <td class="muted" style="font-size:13px">${esc(f.first_reason||"")}</td>
+        <td>${fmtDur(f.duration)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+
+    ${failures.length ? `<div class="mt"><h3>最终失败明细${s.retry_count ? "（重试后仍失败）" : ""}</h3><table>
+      <thead><tr><th>用例</th><th>状态</th><th>重试</th><th>原因</th><th>耗时</th></tr></thead>
       <tbody>${failures.map(f => `<tr><td>${esc(f.case_name||f.case_id)}</td><td>${statusBadge(f.status)}</td>
+        <td>${f.retry_count > 0 ? `<span class="badge retried">↻ ${f.retry_count} 次</span>` : "—"}</td>
         <td class="muted" style="font-size:13px">${esc(f.reason||"")}</td><td>${fmtDur(f.duration)}</td></tr>`).join("")}</tbody></table></div>` : ""}
 
     ${slowest.length ? `<div class="mt"><h3>最慢用例</h3><table>
